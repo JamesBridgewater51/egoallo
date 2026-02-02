@@ -232,3 +232,110 @@ def run_sampling_with_stitching(
         assert start_time is not None
         print("RUNTIME (exclude first optimization)", time.time() - start_time)
         return x_t_list[-1]
+
+
+def run_batched_sampling(
+    denoiser_network: network.EgoDenoiser,
+    Ts_world_cpf: Float[Tensor, "batch time 7"],
+    num_samples: int,
+    device: torch.device,
+    floor_z: float = 0.0,
+) -> network.EgoDenoiseTraj:
+    """
+    Run sampling for a batch of sequences.
+    Assumes Ts_world_cpf is (Batch, Time, 7).
+    No guidance optimization.
+    No sliding window (processes full sequence length).
+    """
+    batch_size = Ts_world_cpf.shape[0]
+    timesteps_seq = Ts_world_cpf.shape[1]
+
+    # Offset floor
+    Ts_world_cpf_shifted = Ts_world_cpf.clone()
+    Ts_world_cpf_shifted[..., 6] -= floor_z
+
+    # Compute relative transforms: (B, T-1, 7)
+    # SE3 inverse and matmul support batching
+    T_cpf_tm1_cpf_t = (
+        SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
+    ).wxyz_xyz
+
+    # Expand to num_samples: (B * num_samples, T-1, 7)
+    # T_cpf_tm1_cpf_t: (B, T-1, 7) -> (B, 1, T-1, 7) -> (B, num_samples, T-1, 7) -> (B*num_samples, T-1, 7)
+    T_cpf_tm1_cpf_t_expanded = T_cpf_tm1_cpf_t[:, None, ...].repeat(1, num_samples, 1, 1).reshape(batch_size * num_samples, timesteps_seq - 1, 7)
+    
+    # Similarly for Ts_world_cpf_shifted: we need it for T_world_cpf arg in forward
+    # Ts_world_cpf_shifted: (B, T, 7). Network expects T starting from t+1.
+    Ts_world_cpf_shifted_expanded = Ts_world_cpf_shifted[:, None, ...].repeat(1, num_samples, 1, 1).reshape(batch_size * num_samples, timesteps_seq, 7)
+
+
+    noise_constants = CosineNoiseScheduleConstants.compute(timesteps=1000).to(
+        device=device
+    )
+    alpha_bar_t = noise_constants.alpha_bar_t
+    alpha_t = noise_constants.alpha_t
+
+    # Initialize noise: (B * num_samples, T-1, d_state)
+    d_state = denoiser_network.get_d_state()
+    x_t_packed = torch.randn(
+        (batch_size * num_samples, timesteps_seq - 1, d_state),
+        device=device,
+    )
+    
+    ts = quadratic_ts()
+
+    for i in tqdm(range(len(ts) - 1), desc="Batched Sampling"):
+        t = ts[i]
+        t_next = ts[i + 1]
+
+        with torch.inference_mode():
+            # forward expects:
+            # x_t: (N, T, D)
+            # t: (N,)
+            # T_cpf_tm1_cpf_t: (N, T, 7)
+            # T_world_cpf: (N, T, 7) (corresponding to t+1 to end)
+
+            x_0_packed_pred = denoiser_network.forward(
+                x_t_packed,
+                torch.tensor([t], device=device).expand((batch_size * num_samples,)),
+                T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t_expanded,
+                T_world_cpf=Ts_world_cpf_shifted_expanded[:, 1:, :], 
+                project_output_rotmats=True,
+                hand_positions_wrt_cpf=None,
+                mask=None,
+            )
+
+        # DDIM update
+        if torch.any(torch.isnan(x_0_packed_pred)):
+            print("found nan", i)
+            
+        sigma_t = torch.cat(
+            [
+                torch.zeros((1,), device=device),
+                torch.sqrt(
+                    (1.0 - alpha_bar_t[:-1]) / (1 - alpha_bar_t[1:]) * (1 - alpha_t)
+                )
+                * 0.8,
+            ]
+        )
+
+        
+        x_t_packed = (
+            torch.sqrt(alpha_bar_t[t_next]) * x_0_packed_pred
+            + (
+                torch.sqrt(1 - alpha_bar_t[t_next] - sigma_t[t] ** 2)
+                * (x_t_packed - torch.sqrt(alpha_bar_t[t]) * x_0_packed_pred)
+                / torch.sqrt(1 - alpha_bar_t[t] + 1e-1)
+            )
+            + sigma_t[t] * torch.randn(x_0_packed_pred.shape, device=device)
+        )
+
+    # Finally unpack
+    # network.EgoDenoiseTraj.unpack expects (N, T, D).
+    flat_traj = network.EgoDenoiseTraj.unpack(
+        x_t_packed,
+        include_hands=denoiser_network.config.include_hands,
+        project_rotmats=True
+    )
+    
+    return flat_traj

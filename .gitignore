@@ -21,3 +21,4 @@ egoallo_checkpoint_*
 egoallo_example_*
 
 out/
+experiments/
