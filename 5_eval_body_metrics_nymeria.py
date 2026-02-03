@@ -4,7 +4,7 @@
 from pathlib import Path
 from typing import List, TypeVar
 
-import jax.tree
+
 import numpy as np
 import torch
 import torch.utils.data
@@ -206,11 +206,21 @@ def main(
 
     print("=" * 80)
     print("Final Metrics")
-    for k, v in jax.tree.map(
-        lambda *x: f"{np.mean(x):.3f} +/- {np.std(x) / np.sqrt(len(metrics) * num_samples):.3f}",
-        *metrics,
-    ).items():
-        print("\t", k, v)
+    metric_keys = metrics[0].keys() if metrics else []
+    
+    if not metrics:
+        print("\tNo metrics collected.")
+    else:
+        for k in metric_keys:
+            # Gather all values for this metric key across the batch
+            values = [m[k] for m in metrics]
+            # Compute stats
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            sem_val = std_val / np.sqrt(len(metrics) * num_samples)
+            
+            print(f"\t {k} {mean_val:.3f} +/- {sem_val:.3f}")
+
     print("=" * 80)
 
 if __name__ == "__main__":

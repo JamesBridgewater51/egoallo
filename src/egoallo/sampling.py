@@ -306,8 +306,8 @@ def run_batched_sampling(
             )
 
         # DDIM update
-        if torch.any(torch.isnan(x_0_packed_pred)):
-            print("found nan", i)
+        # if torch.any(torch.isnan(x_0_packed_pred)):
+        #     print("found nan", i)
             
         sigma_t = torch.cat(
             [

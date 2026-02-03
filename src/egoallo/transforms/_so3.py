@@ -235,15 +235,43 @@ class SO3(_base.SOBase):
         return self.wxyz
 
     # Operations.
-
     @override
     def apply(self, target: Tensor) -> Tensor:
         assert target.shape[-1] == 3
+        
+        w = self.wxyz[..., 0:1]  # (..., 1)
+        xyz = self.wxyz[..., 1:] # (..., 3)
 
-        # Compute using quaternion multiplys.
-        padded_target = torch.cat([torch.ones_like(target[..., :1]), target], dim=-1)
-        out = self.multiply(SO3(wxyz=padded_target).multiply(self.inverse()))
-        return out.wxyz[..., 1:]
+        # 1. 自动对齐维度数量 (Rank)
+        # 如果 self 是 [256, 128, 4], target 是 [3]，
+        # target 需要变成 [1, 1, 3] 才能让 ndim 一致。
+        # 如果 self 是 [4], target 是 [256, 128, 3]，
+        # xyz 需要变成 [1, 1, 3] 才能让 ndim 一致。
+        
+        ndim_diff = target.ndim - xyz.ndim
+        if ndim_diff > 0:
+            # 扩展 self 的维度
+            xyz_view = xyz.view((1,) * ndim_diff + xyz.shape)
+            w_view = w.view((1,) * ndim_diff + w.shape)
+            target_view = target
+        elif ndim_diff < 0:
+            # 扩展 target 的维度
+            xyz_view = xyz
+            w_view = w
+            target_view = target.view((1,) * (-ndim_diff) + target.shape)
+        else:
+            xyz_view = xyz
+            w_view = w
+            target_view = target
+
+        # 2. 计算高效旋转：v' = v + 2*w*(xyz x v) + 2*(xyz x (xyz x v))
+        # 此时 xyz_view 和 target_view 的 ndim 一致，
+        # torch.cross 会自动处理维度大小为 1 的广播 (例如 [256, 128] vs [1, 128])
+        
+        t = 2.0 * torch.cross(xyz_view, target_view, dim=-1)
+        out = target_view + w_view * t + torch.cross(xyz_view, t, dim=-1)
+        
+        return out
 
     @override
     def multiply(self, other: SO3) -> SO3:  # type: ignore

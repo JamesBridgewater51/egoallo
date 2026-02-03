@@ -15,7 +15,31 @@ from torch import Tensor, nn
 from .fncsmpl import SmplhModel, SmplhShapedAndPosed
 from .tensor_dataclass import TensorDataclass
 from .transforms import SE3, SO3
+import torch.nn.functional as F
 
+def project_rotmats_via_gs(rotmats: torch.Tensor) -> torch.Tensor:
+    """
+    使用 Gram-Schmidt 正交化代替 SVD，速度快得多。
+    假设 rotmats 形状为 (..., 3, 3)
+    """
+    # 取出前两列向量
+    col1 = rotmats[..., 0]
+    col2 = rotmats[..., 1]
+
+    # 1. 标准化第一列 (x轴)
+    x_axis = F.normalize(col1, dim=-1)
+
+    # 2. 让第二列与第一列垂直 (Gram-Schmidt)
+    # y_proj = y - (y . x) * x
+    dot_prod = torch.sum(col2 * x_axis, dim=-1, keepdim=True)
+    y_axis = col2 - dot_prod * x_axis
+    y_axis = F.normalize(y_axis, dim=-1)
+
+    # 3. 通过叉乘计算第三列 (z轴)
+    z_axis = torch.cross(x_axis, y_axis, dim=-1)
+
+    # 4. 堆叠回 3x3 矩阵
+    return torch.stack([x_axis, y_axis, z_axis], dim=-1)
 
 def project_rotmats_via_svd(
     rotmats: Float[Tensor, "*batch 3 3"],
@@ -108,7 +132,7 @@ class EgoDenoiseTraj(TensorDataclass):
 
         if project_rotmats:
             # We might want to handle the -1 determinant case as well.
-            body_rotmats = project_rotmats_via_svd(body_rotmats)
+            body_rotmats = project_rotmats_via_gs(body_rotmats)
 
         return EgoDenoiseTraj(
             betas=betas,
@@ -534,7 +558,7 @@ class EgoDenoiser(nn.Module):
             [
                 # Project rotation matrices for body_rotmats via SVD,
                 (
-                    project_rotmats_via_svd(
+                    project_rotmats_via_gs(
                         modality_decoder(decoder_out).reshape((-1, 3, 3))
                     ).reshape(
                         (batch, time, {"body_rotmats": 21, "hand_rotmats": 30}[key] * 9)
